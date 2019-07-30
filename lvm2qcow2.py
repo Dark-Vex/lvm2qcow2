@@ -22,11 +22,12 @@ import sys
 import time
 import glob
 import subprocess
+import logging
 from argparse import ArgumentParser
 
 __author__ = "Luca Giovenzana <luca@giovenzana.org>"
-__date__ = "2015-04-08"
-__version__ = "0.1beta2"
+__date__ = "2017-04-07"
+__version__ = "0.2.1"
 
 
 # TODO add parameter defaults and help
@@ -37,9 +38,38 @@ __version__ = "0.1beta2"
 # TODO write a run function to include subprocess code
 # TODO check image file already exists
 # TODO if exception occurs snapshot should be removed
-# TODO print data transferrend and the time
+# TODO print data transferred and the time required
 
-class Device():
+
+class LogFilterLessThan(logging.Filter):
+    def __init__(self, exclusive_maximum, name=""):
+        super(LogFilterLessThan, self).__init__(name)
+        self.max_level = exclusive_maximum
+
+    def filter(self, record):
+        return True if record.levelno < self.max_level else False
+
+
+# FIXME change logging level for production
+# create logger
+logger = logging.getLogger('lvm2qcow2')
+logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - '
+                              '%(levelname)s - %(message)s')
+# Handler for levels that go to standard output
+handler_stdout = logging.StreamHandler(sys.stdout)
+handler_stdout.setLevel(logging.DEBUG)
+handler_stdout.addFilter(LogFilterLessThan(logging.WARNING))
+handler_stdout.setFormatter(formatter)
+logger.addHandler(handler_stdout)
+# Handler for the remaining levels that go to standard error
+handler_stderr = logging.StreamHandler(sys.stderr)
+handler_stderr.setFormatter(formatter)
+handler_stderr.setLevel(logging.WARNING)
+logger.addHandler(handler_stderr)
+
+
+class Device:
 
     def __init__(self, path):
         # get path, vg, lv and size from lvdisplay
@@ -47,10 +77,10 @@ class Device():
             out = subprocess.check_output(['lvdisplay', path],
                                           stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as e:
-            print "ERROR:", e.output
+            logger.error(e.output)
             sys.exit(1)
         except OSError as e:
-            print "OSError: lvdisplay command not found"
+            logger.error("OSError: {}".format(e))
             sys.exit(1)
         else:
             lv_path = re.findall('LV Path\s+(.+)', out)
@@ -77,23 +107,24 @@ class Device():
         if name is None:
             name = '{}-lvm2qcow2-snapshot'.format(self.lv)
         try:
+            logger.debug("snapshot size: {}".format(snapshot_size))
             subprocess.check_output(['lvcreate', '-s', self.path,
                                      '-n', name,
                                      '-L', snapshot_size],
                                     stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as e:
             if "already exists" in e.output:
-                print "WARNING: {} "\
-                      "already exists deleting it".format(name)
+                logger.warning("snapshot {} "
+                               "already exists deleting it".format(name))
                 # delete the pending snapshot
                 self.delete_snapshot(name)
                 # recursively create the snapshot
-                self.create_snapshot(name)
+                self.create_snapshot(name, snapshot_size)
             else:
-                print "ERROR:", e.output
+                logger.error(e.output)
                 sys.exit(1)
         except OSError as e:
-            print "OSError: lvcreate command not found"
+            logger.error("OSError: {}".format(e))
             sys.exit(1)
         # adding the full path
         snapshot_name = os.path.join(os.path.dirname(self.path), name)
@@ -109,16 +140,16 @@ class Device():
             subprocess.check_output(['lvremove', '-f', snapshot_name],
                                     stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as e:
-            print "ERROR:", e.output
+            logger.error(e.output)
             sys.exit(1)
         except OSError as e:
-            print "OSError: lvremove command not found"
+            logger.error("OSError: {}".format(e))
             sys.exit(1)
 
         return snapshot_name
 
 
-class Images():
+class Images:
     def __init__(self, path, prefix, suffix='.qcow2'):
         self.files = [os.path.abspath(i) for i in glob.glob(os.path.join(path,
                       '{}*{}'.format(prefix, suffix)))]
@@ -127,17 +158,17 @@ class Images():
     def keep_only(self, copies):
         # TODO delete also md5sum file
         # 0 means infinite so the loop should not be executed
-        print "images:", self.files
-        print "number of copies to keep:", copies
+        logger.debug("images: %s", self.files)
+        logger.debug("number of copies to keep: %s", copies)
         while (len(self.files) > copies) and (copies != 0):
             image_to_remove = self.files.pop()
-            print "removing image: {}".format(image_to_remove[0])
+            logger.info("removing image: {}".format(image_to_remove))
             try:
                 # added full path to avoid aliases that works with -i
                 subprocess.check_output(['/bin/rm', image_to_remove],
                                         stderr=subprocess.STDOUT)
             except subprocess.CalledProcessError as e:
-                print "ERROR:", e.output
+                logger.error(e.output)
                 sys.exit(1)
 
     def __iter__(self):
@@ -153,10 +184,10 @@ def _qemu_img_cmd(source, destination, image):
                                  source, destination],
                                 stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as e:
-        print "ERROR:", e.output
+        logger.error(e.output)
         sys.exit(1)
     except OSError as e:
-        print "OSError: qemu-img command not found"
+        logger.error("OSError: {}".format(e))
         sys.exit(1)
     else:
         return destination
@@ -186,27 +217,33 @@ def main():
                              " otherwise keeps the number of specified copies")
 
     parser.add_argument("-S", "--snapshot-size",
-                        action='store', dest='SIZE', type=int,
-                        help="")
+                        action='store', dest='SNAPSHOT_SIZE', type=str, default="5g",
+                        help="size of the temporary logical volume snapshot,"
+                             " this is the maximum size of the change accepted"
+                             " while doing the backup."
+                             " WARNING if the 100 usage of the lv snapshot"
+                             " is reached the backup will be corrupted.")
 
     parser.add_argument('--version', action='version',
                         version="%(prog)s {}".format(__version__))
 
-    print "lvm2qcow2 started:", time.strftime('%Y-%m-%d %H:%M:%S')
-
     # Validate and manipulate arguments input
     args = parser.parse_args()
+
+    logger.info("lvm2qcow2 started")
+
     # Create the source device object getting data with lvdisplay
     src_device = Device(args.SOURCE)
-    print "source: {}".format(src_device.path)
+    logger.info("source: {}".format(src_device.path))
 
     # Check destination folder exists and is a directory
     if os.path.isdir(args.DESTINATION):
         dst_dir = args.DESTINATION
     else:
-        print "OSError: '{}' invalid destination".format(args.DESTINATION)
+        logger.error("OSError: '%s' invalid destination",
+                     args.DESTINATION)
         sys.exit(1)
-    print "destination: {}".format(dst_dir)
+    logger.info("destination: {}".format(dst_dir))
 
     # If prefix is not provided lv name will be used as default prefix
     if args.IMAGE_PREFIX:
@@ -215,21 +252,22 @@ def main():
         image_prefix = src_device.lv
     timestamp = time.strftime('%Y-%m-%d')
     image = '{}-{}.qcow2'.format(image_prefix, timestamp)
-    print "image: {}".format(image)
+    logger.debug("image: {}".format(image))
 
     # Create the lv snapshot
-    snapshot = src_device.create_snapshot()
-    print "created snapshot: {}".format(snapshot)
+    snapshot = src_device.create_snapshot(snapshot_size=args.SNAPSHOT_SIZE)
+    logger.debug("created snapshot: {}".format(snapshot))
     qcow2_file = _qemu_img_cmd(snapshot, dst_dir, image)
-    print "created image: {}".format(qcow2_file)
+    logger.info("created image: {}".format(qcow2_file))
     snapshot = src_device.delete_snapshot()
-    print "deleted: {}".format(snapshot)
+    logger.debug("deleted snapshot: {}".format(snapshot))
 
     # Delete old copies
     images = Images(dst_dir, image_prefix)
     images.keep_only(args.COPIES)
 
     return 0
+
 
 if __name__ == '__main__':
     main()
